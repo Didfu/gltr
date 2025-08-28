@@ -19,7 +19,7 @@ const current = {
     },
     demo: true,
     entropyThreshold: 10,
-    project_name: 'gpt-2-small'
+    project_name: 'gemma-3n-E2B-it'
 };
 
 

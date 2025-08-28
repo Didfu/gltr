@@ -15,7 +15,7 @@ __author__ = 'Hendrik Strobelt, Sebastian Gehrmann'
 CONFIG_FILE_NAME = 'lmf.yml'
 projects = {}
 
-app = connexion.App(__name__, debug=False)
+app = connexion.App(__name__)
 
 
 class Project:
@@ -34,14 +34,14 @@ def get_all_projects():
 def analyze(analyze_request):
     project = analyze_request.get('project')
     text = analyze_request.get('text')
-
+    topk = analyze_request.get('topk', 20)
     res = {}
     if project in projects:
         p = projects[project] # type: Project
-        res = p.lm.check_probabilities(text, topk=20)
+        res = p.lm.check_probabilities(text, topk=topk)
 
     return {
-        "request": {'project': project, 'text': text},
+        "request": {'project': project, 'text': text, 'topk': topk},
         "result": res
     }
 
@@ -119,7 +119,7 @@ def send_data(path):
 app.add_api('server.yaml')
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--model", default='gpt-2-small')
+parser.add_argument("--model", default='gemma-3n-E2B-it')
 parser.add_argument("--nodebug", default=True)
 parser.add_argument("--address",
                     default="127.0.0.1")  # 0.0.0.0 for nonlocal use
@@ -135,15 +135,14 @@ if __name__ == '__main__':
     if not args.no_cors:
         CORS(app.app, headers='Content-Type')
 
-    app.run(port=int(args.port), debug=not args.nodebug, host=args.address)
+    app.run(port=int(args.port), host=args.address)
 else:
     args, _ = parser.parse_known_args()
     # load_projects(args.dir)
     try:
         model = AVAILABLE_MODELS[args.model]
     except KeyError:
-        print("Model {} not found. Make sure to register it.".format(
-            args.model))
-        print("Loading GPT-2 instead.")
-        model = AVAILABLE_MODELS['gpt-2']
+        print(f"Model {args.model} not found. Loading GPT-2-small instead.")
+        model = AVAILABLE_MODELS['gemma-3n-E2B-it']
+
     projects[args.model] = Project(model, args.model)

@@ -42,6 +42,13 @@ python server.py --model BERT
 the instance runs now at [http://localhost:5001/client/index.html?nodemo](http://localhost:5001/client/index.html?nodemo). HINT: we only provide demo texts for `gpt2-small`.
 
 
+# Run Gemma
+
+```bash
+python server.py --model gemma-3n-E2B-it
+```
+# for other models, add in api.py, change start.js(it has hardcoded model request name[both normal and examples one]) and change start.ts(from src\ts)
+
 ## server.py options
 
 ```

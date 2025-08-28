@@ -1,11 +1,18 @@
+import token
 import numpy as np
 import torch
 import time
+import os
+from dotenv import load_dotenv
 
-from transformers import (GPT2LMHeadModel, GPT2Tokenizer,
-                          BertTokenizer, BertForMaskedLM)
+from transformers import (GPT2LMHeadModel, GPT2Tokenizer, BertTokenizer, BertForMaskedLM, AutoTokenizer, AutoModelForCausalLM)
 from .class_register import register_api
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+dotenv_path = os.path.join(PROJECT_ROOT, ".env")
+
+load_dotenv(dotenv_path)
+auth = os.getenv("auth")
 
 class AbstractLanguageChecker:
     """
@@ -23,6 +30,7 @@ class AbstractLanguageChecker:
         """
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
+        
 
     def check_probabilities(self, in_text, topk=40):
         """
@@ -44,13 +52,23 @@ class AbstractLanguageChecker:
         raise NotImplementedError
 
     def postprocess(self, token):
-        """
-        clean up the tokens from any special chars and encode
-        leading space by UTF-8 code '\u0120', linebreak with UTF-8 code 266 '\u010A'
-        :param token:  str -- raw token text
-        :return: str -- cleaned and re-encoded token text
-        """
-        raise NotImplementedError
+    # Handle torch.Tensor or numpy.int
+        if hasattr(token, "item"):
+            token = token.item()
+        if isinstance(token, str):
+            return token    
+
+    # If it's a single int → wrap in list
+        if isinstance(token, int):
+            return self.tokenizer.decode([token], clean_up_tokenization_spaces=True)
+
+    # If it's already a list/tuple/array of ints
+        if isinstance(token, (list, tuple)):
+            return self.tokenizer.decode(token, clean_up_tokenization_spaces=True)
+
+        raise TypeError(f"Unsupported token type: {type(token)}")
+
+
 
 
 def top_k_logits(logits, k):
@@ -67,116 +85,228 @@ def top_k_logits(logits, k):
                        logits)
 
 
+@register_api(name='gemma-3n-E2B-it')
+class GemmaLM(AbstractLanguageChecker):
+    def __init__(self, model_name_or_path="google/gemma-3n-E2B-it", hfauth=auth):
+        super(GemmaLM, self).__init__()
+        
+        # Load tokenizer and model
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, token=hfauth)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            torch_dtype=torch.float32,
+            token=hfauth,
+            device_map="auto" if torch.cuda.is_available() else None
+        )
+        
+        # Move to device if not using device_map="auto"
+        if not torch.cuda.is_available():
+            self.model.to(self.device)
+            
+        self.model.eval()
+        
+        # Set pad token if it doesn't exist
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+        print(f"Loaded Gemma-3n-E2B-it model on {self.device}")
+
+    def check_probabilities(self, in_text, topk=40):
+    # Tokenize input
+     inputs = self.tokenizer(in_text, return_tensors='pt')
+     token_ids = inputs["input_ids"][0]
+
+    # Move to device
+     token_ids = token_ids.to(self.device)
+
+    # Forward pass
+     with torch.no_grad():
+        outputs = self.model(token_ids.unsqueeze(0))
+        logits = outputs.logits  # [1, seq_len, vocab_size]
+
+      # Drop batch dim, ignore last token (since no next-token to compare)
+     all_logits = logits[0, :-1, :]
+     all_probs = torch.softmax(all_logits, dim=-1)
+
+    # Shifted targets
+     y = token_ids[1:]
+
+    # Sort predictions
+     sorted_preds = torch.argsort(all_probs, dim=1, descending=True).cpu()
+
+    # Real token positions + probs
+     real_topk_pos = []
+     for i in range(y.shape[0]):
+        positions = (sorted_preds[i] == y[i].item()).nonzero(as_tuple=True)[0]
+        pos = int(positions[0]) if len(positions) > 0 else -1
+        real_topk_pos.append(pos)
+
+     real_topk_probs = all_probs[torch.arange(y.shape[0]), y].detach().cpu().numpy().round(5).tolist()
+     real_topk = list(zip(real_topk_pos, real_topk_probs))
+
+    # Decode tokens (BPE/subword level, like GPT-2)
+     bpe_strings = self.tokenizer.convert_ids_to_tokens(token_ids.tolist())
+     bpe_strings = [self.postprocess(s) for s in bpe_strings]
+
+    # Top-k predictions (use convert_ids_to_tokens, NOT decode())
+     topk_prob_values, topk_prob_inds = torch.topk(all_probs, k=topk, dim=1)
+     pred_topk = [
+        [
+            (self.postprocess(tok), float(prob))
+            for tok, prob in zip(
+                self.tokenizer.convert_ids_to_tokens(topk_prob_inds[i].tolist()),
+                topk_prob_values[i].detach().cpu().numpy()
+            )
+        ]
+        for i in range(y.shape[0])
+    ]
+
+     if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+     return {
+        "bpe_strings": bpe_strings,
+        "real_topk": real_topk,
+        "pred_topk": pred_topk
+    }
+
+
+    def sample_unconditional(self, length=100, topk=5, temperature=1.0):
+        # Start with BOS token or empty input
+        if hasattr(self.tokenizer, 'bos_token_id') and self.tokenizer.bos_token_id is not None:
+            input_ids = torch.tensor([[self.tokenizer.bos_token_id]]).to(self.device)
+        else:
+            # For models without BOS token, start with a simple prompt
+            input_ids = self.tokenizer("", return_tensors='pt')["input_ids"].to(self.device)
+            if input_ids.shape[1] == 0:
+                # If empty, use EOS as start token
+                input_ids = torch.tensor([[self.tokenizer.eos_token_id]]).to(self.device)
+
+        with torch.no_grad():
+            for _ in range(length):
+                outputs = self.model(input_ids)
+                logits = outputs.logits[:, -1, :] / temperature
+                
+                # Apply top-k filtering
+                filtered_logits = top_k_logits(logits, topk)
+                probs = torch.softmax(filtered_logits, dim=-1)
+                
+                # Sample next token
+                next_token = torch.multinomial(probs, num_samples=1)
+                input_ids = torch.cat([input_ids, next_token], dim=1)
+                
+                # Stop if we hit EOS token
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    break
+
+        return self.tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=True)
+
+    def postprocess(self, token: str) -> str:
+     """
+    Clean up raw tokens from Gemma tokenizer so they display like GPT-2 tokens in GLTR.
+     """
+
+     if hasattr(token, "item"):
+        token = token.item()
+
+     if isinstance(token, int):
+        return self.tokenizer.convert_ids_to_tokens([token])[0]
+
+     if isinstance(token, (list, tuple)):
+        token = self.tokenizer.convert_ids_to_tokens(token)[0]
+
+    # ---- Cleanup rules ----
+     if not isinstance(token, str):
+        return str(token)
+
+    # Leading whitespace marker (like GPT-2's Ġ)
+     if token.startswith("▁"):  # SentencePiece-style "word boundary"
+        token = " " + token[1:]
+
+    # Handle common special markers
+     if token in ["<bos>", "<s>", "</s>", "<pad>", "<unk>", "<eos>"]:
+        return token
+
+    # Normalize unicode punctuation like GPT-2 does
+     token = token.replace("Ċ", "\n") \
+                 .replace("Ġ", " ") \
+                 .replace("â€", "\"") \
+                 .replace("â€™", "'") \
+                 .replace("â€“", "-")
+
+     return token
+
+
+
 @register_api(name='gpt-2-small')
 class LM(AbstractLanguageChecker):
-    def __init__(self, model_name_or_path="gpt2"):
+    def __init__(self, model_name_or_path="gpt2", tokenizer=GPT2Tokenizer):
         super(LM, self).__init__()
         self.enc = GPT2Tokenizer.from_pretrained(model_name_or_path)
         self.model = GPT2LMHeadModel.from_pretrained(model_name_or_path)
         self.model.to(self.device)
         self.model.eval()
-        self.start_token = self.enc(self.enc.bos_token, return_tensors='pt').data['input_ids'][0]
+        self.start_token = self.enc(self.enc.bos_token, return_tensors='pt')["input_ids"][0]
+        self.tokenizer = tokenizer
         print(f"Loaded GPT-2 model! on {self.device}")
 
     def check_probabilities(self, in_text, topk=40):
         # Process input
-        token_ids = self.enc(in_text, return_tensors='pt').data['input_ids'][0]
-        token_ids = torch.concat([self.start_token, token_ids])
-        # Forward through the model
-        output = self.model(token_ids.to(self.device))
-        all_logits = output.logits[:-1].detach().squeeze()
-        # construct target and pred
-        # yhat = torch.softmax(logits[0, :-1], dim=-1)
-        all_probs = torch.softmax(all_logits, dim=1)
+        token_ids = self.enc(in_text, return_tensors='pt')["input_ids"][0]
+        token_ids = torch.cat([self.start_token, token_ids])
 
-        y = token_ids[1:]
+        # Forward through the model (new HF API)
+        outputs = self.model(token_ids.unsqueeze(0).to(self.device))
+        logits = outputs.logits  # shape: [1, seq_len, vocab_size]
+
+        # Drop batch dim, ignore last token (since no next-token to compare)
+        all_logits = logits[0, :-1, :]
+        all_probs = torch.softmax(all_logits, dim=-1)
+
+        y = token_ids[1:]  # targets (shifted by 1)
+
         # Sort the predictions for each timestep
         sorted_preds = torch.argsort(all_probs, dim=1, descending=True).cpu()
-        # [(pos, prob), ...]
-        real_topk_pos = list(
-            [int(np.where(sorted_preds[i] == y[i].item())[0][0])
-             for i in range(y.shape[0])])
-        real_topk_probs = all_probs[np.arange(
-            0, y.shape[0], 1), y].data.cpu().numpy().tolist()
-        real_topk_probs = list(map(lambda x: round(x, 5), real_topk_probs))
 
+        real_topk_pos = [int((sorted_preds[i] == y[i].item()).nonzero()[0])
+                         for i in range(y.shape[0])]
+
+        real_topk_probs = all_probs[torch.arange(y.shape[0]), y].detach().cpu().numpy().round(5).tolist()
         real_topk = list(zip(real_topk_pos, real_topk_probs))
-        # [str, str, ...]
-        bpe_strings = self.enc.convert_ids_to_tokens(token_ids[:])
 
+        # Decode tokens
+        bpe_strings = self.enc.convert_ids_to_tokens(token_ids.tolist())
         bpe_strings = [self.postprocess(s) for s in bpe_strings]
 
+        # Top-k predictions
         topk_prob_values, topk_prob_inds = torch.topk(all_probs, k=topk, dim=1)
+        pred_topk = [
+            [(self.postprocess(tok), float(prob)) for tok, prob in
+             zip(self.enc.convert_ids_to_tokens(topk_prob_inds[i]),
+                 topk_prob_values[i].detach().cpu().numpy())]
+            for i in range(y.shape[0])
+        ]
 
-        pred_topk = [list(zip(self.enc.convert_ids_to_tokens(topk_prob_inds[i]),
-                              topk_prob_values[i].data.cpu().numpy().tolist()
-                              )) for i in range(y.shape[0])]
-        pred_topk = [[(self.postprocess(t[0]), t[1]) for t in pred] for pred in pred_topk]
-
-
-        # pred_topk = []
-        payload = {'bpe_strings': bpe_strings,
-                   'real_topk': real_topk,
-                   'pred_topk': pred_topk}
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return payload
+        return {"bpe_strings": bpe_strings,
+                "real_topk": real_topk,
+                "pred_topk": pred_topk}
 
     def sample_unconditional(self, length=100, topk=5, temperature=1.0):
-        '''
-        Sample `length` words from the model.
-        Code strongly inspired by
-        https://github.com/huggingface/pytorch-pretrained-BERT/blob/master/examples/run_gpt2.py
+        input_ids = torch.tensor([self.start_token.tolist()]).to(self.device)
 
-        '''
-        context = torch.full((1, 1),
-                             self.enc.encoder[self.start_token],
-                             device=self.device,
-                             dtype=torch.long)
-        prev = context
-        output = context
-        past = None
-        # Forward through the model
         with torch.no_grad():
-            for i in range(length):
-                logits, past = self.model(prev, past=past)
-                logits = logits[:, -1, :] / temperature
-                # Filter predictions to topk and softmax
-                probs = torch.softmax(top_k_logits(logits, k=topk),
-                                      dim=-1)
-                # Sample
-                prev = torch.multinomial(probs, num_samples=1)
-                # Construct output
-                output = torch.cat((output, prev), dim=1)
+            for _ in range(length):
+                outputs = self.model(input_ids)
+                logits = outputs.logits[:, -1, :] / temperature
+                filtered_logits = top_k_logits(logits, topk)
+                probs = torch.softmax(filtered_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                input_ids = torch.cat([input_ids, next_token], dim=1)
 
-        output_text = self.enc.decode(output[0].tolist())
-        return output_text
-
-    def postprocess(self, token):
-        with_space = False
-        with_break = False
-        if token.startswith('Ġ'):
-            with_space = True
-            token = token[1:]
-            # print(token)
-        elif token.startswith('â'):
-            token = ' '
-        elif token.startswith('Ċ'):
-            token = ' '
-            with_break = True
-
-        token = '-' if token.startswith('â') else token
-        token = '“' if token.startswith('ľ') else token
-        token = '”' if token.startswith('Ŀ') else token
-        token = "'" if token.startswith('Ļ') else token
-
-        if with_space:
-            token = '\u0120' + token
-        if with_break:
-            token = '\u010A' + token
-
-        return token
+        return self.enc.decode(input_ids[0].tolist())
 
 
 # @register_api(name='BERT')
@@ -269,7 +399,7 @@ class BERTLM(AbstractLanguageChecker):
                          max_context + 1]
                 yhat = torch.softmax(logits, dim=-1)
 
-                sorted_preds = np.argsort(-yhat.data.cpu().numpy())
+                sorted_preds = np.argsort(-yhat.data.detach().cpu().numpy())
                 # TODO: compare with batch of tgt
 
                 # [(pos, prob), ...]
@@ -277,14 +407,14 @@ class BERTLM(AbstractLanguageChecker):
                     [int(np.where(sorted_preds[i] == tgt[i].item())[0][0])
                      for i in range(yhat.shape[0])])
                 real_topk_probs = yhat[np.arange(
-                    0, yhat.shape[0], 1), tgt].data.cpu().numpy().tolist()
+                    0, yhat.shape[0], 1), tgt].data.detach().cpu().numpy().tolist()
                 real_topk.extend(list(zip(real_topk_pos, real_topk_probs)))
 
                 # # [[(pos, prob), ...], [(pos, prob), ..], ...]
                 pred_topk.extend([list(zip(self.tokenizer.convert_ids_to_tokens(
                     sorted_preds[i][:topk]),
                     yhat[i][sorted_preds[i][
-                            :topk]].data.cpu().numpy().tolist()))
+                            :topk]].data.detach().cpu().numpy().tolist()))
                     for i in range(yhat.shape[0])])
 
         bpe_strings = [self.postprocess(s) for s in tokenized_text]
@@ -360,6 +490,21 @@ def main():
     sample = lm.sample_unconditional()
     end = time.time()
     print("{:.2f} Seconds for a sample from GPT-2".format(end - start))
+    print("SAMPLE:", sample)
+
+    '''
+    Tests for Gemma 3n
+    '''
+    lm = GemmaLM()
+    start = time.time()
+    payload = lm.check_probabilities(raw_text, topk=5)
+    end = time.time()
+    print("{:.2f} Seconds for a check with Gemma-3n-E2B-it".format(end - start))
+    
+    start = time.time()
+    sample = lm.sample_unconditional()
+    end = time.time()
+    print("{:.2f} Seconds for a sample from Gemma-3n-E2B-it".format(end - start))
     print("SAMPLE:", sample)
 
 

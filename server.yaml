@@ -40,7 +40,7 @@ paths:
 
       responses:
         200:
-          description: return translation
+          description: return analysis results
           schema:
             type: object
 
@@ -59,3 +59,8 @@ definitions:
         type: string
       text:
         type: string
+      topk:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
