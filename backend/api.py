@@ -112,131 +112,112 @@ class GemmaLM(AbstractLanguageChecker):
         print(f"Loaded Gemma-3n-E2B-it model on {self.device}")
 
     def check_probabilities(self, in_text, topk=40):
+      print("--- RUNNING THE LATEST CODE VERSION ---") 
     # Tokenize input
-     inputs = self.tokenizer(in_text, return_tensors='pt')
-     token_ids = inputs["input_ids"][0]
-
-    # Move to device
-     token_ids = token_ids.to(self.device)
+      inputs = self.tokenizer(in_text, return_tensors='pt')
+      token_ids = inputs["input_ids"][0]
+      token_ids = token_ids.to(self.device)
 
     # Forward pass
-     with torch.no_grad():
+      with torch.no_grad():
         outputs = self.model(token_ids.unsqueeze(0))
-        logits = outputs.logits  # [1, seq_len, vocab_size]
+        logits = outputs.logits
 
-      # Drop batch dim, ignore last token (since no next-token to compare)
-     all_logits = logits[0, :-1, :]
-     all_probs = torch.softmax(all_logits, dim=-1)
-
-    # Shifted targets
-     y = token_ids[1:]
+      all_logits = logits[0, :-1, :]
+      all_probs = torch.softmax(all_logits, dim=-1)
+      y = token_ids[1:]
 
     # Sort predictions
-     sorted_preds = torch.argsort(all_probs, dim=1, descending=True).cpu()
+      sorted_preds = torch.argsort(all_probs, dim=1, descending=True).cpu()
 
     # Real token positions + probs
-     real_topk_pos = []
-     for i in range(y.shape[0]):
+      real_topk_pos = []
+      for i in range(y.shape[0]):
         positions = (sorted_preds[i] == y[i].item()).nonzero(as_tuple=True)[0]
         pos = int(positions[0]) if len(positions) > 0 else -1
         real_topk_pos.append(pos)
 
-     real_topk_probs = all_probs[torch.arange(y.shape[0]), y].detach().cpu().numpy().round(5).tolist()
-     real_topk = list(zip(real_topk_pos, real_topk_probs))
+      real_topk_probs = all_probs[torch.arange(y.shape[0]), y].detach().cpu().numpy().round(5).tolist()
+      real_topk = list(zip(real_topk_pos, real_topk_probs))
 
-    # Decode tokens (BPE/subword level, like GPT-2)
-     bpe_strings = self.tokenizer.convert_ids_to_tokens(token_ids.tolist())
-     bpe_strings = [self.postprocess(s) for s in bpe_strings]
+    # Get raw tokens and create properly spaced bpe_strings
+      raw_tokens = self.tokenizer.convert_ids_to_tokens(token_ids.tolist())
+      bpe_strings = []
+      for token in raw_tokens:
+        if token in ['<bos>', '</s>', '<pad>']:
+            bpe_strings.append(f'⟨{token[1:-1]}⟩')
+        else:
+            processed_token = self.process_single_token(token)
+            bpe_strings.append(processed_token)
 
-    # Top-k predictions (use convert_ids_to_tokens, NOT decode())
-     topk_prob_values, topk_prob_inds = torch.topk(all_probs, k=topk, dim=1)
-     pred_topk = [
-        [
-            (self.postprocess(tok), float(prob))
-            for tok, prob in zip(
-                self.tokenizer.convert_ids_to_tokens(topk_prob_inds[i].tolist()),
-                topk_prob_values[i].detach().cpu().numpy()
-            )
-        ]
-        for i in range(y.shape[0])
-    ]
+    # Top-k predictions with proper spacing
+      topk_prob_values, topk_prob_inds = torch.topk(all_probs, k=topk, dim=1)
+      pred_topk = []
+      for i in range(y.shape[0]):
+        token_probs = []
+        for token_id, prob in zip(topk_prob_inds[i].tolist(), topk_prob_values[i].detach().cpu().numpy()):
+            raw_token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+            
+            if raw_token in ['<bos>', '</s>', '<pad>']:
+                display_token = f'⟨{raw_token[1:-1]}⟩'
+            else:
+                display_token = self.process_single_token(raw_token)
+            
+            token_probs.append((display_token, float(prob)))
+        pred_topk.append(token_probs)
 
-     if torch.cuda.is_available():
+      if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-     return {
+      final_text = "".join(bpe_strings)
+    
+      result = {
         "bpe_strings": bpe_strings,
         "real_topk": real_topk,
-        "pred_topk": pred_topk
+        "pred_topk": pred_topk,
+        "final_text": final_text  # Add the correctly formatted string
     }
 
+      print("--- FINAL DATA BEING SENT TO FRONTEND ---", result)
+      return result
 
-    def sample_unconditional(self, length=100, topk=5, temperature=1.0):
-        # Start with BOS token or empty input
-        if hasattr(self.tokenizer, 'bos_token_id') and self.tokenizer.bos_token_id is not None:
-            input_ids = torch.tensor([[self.tokenizer.bos_token_id]]).to(self.device)
-        else:
-            # For models without BOS token, start with a simple prompt
-            input_ids = self.tokenizer("", return_tensors='pt')["input_ids"].to(self.device)
-            if input_ids.shape[1] == 0:
-                # If empty, use EOS as start token
-                input_ids = torch.tensor([[self.tokenizer.eos_token_id]]).to(self.device)
+    def process_single_token(self, token):
+     """Process a single token for display"""
+     processed_token = token
+    
+    # Handle different tokenizer space markers
+     if processed_token.startswith('▁'):  # SentencePiece underscore
+        processed_token = ' ' + processed_token[1:]
+     elif processed_token.startswith('Ġ'):  # GPT-style space marker
+        processed_token = ' ' + processed_token[1:]
+    
+     return processed_token
 
-        with torch.no_grad():
-            for _ in range(length):
-                outputs = self.model(input_ids)
-                logits = outputs.logits[:, -1, :] / temperature
-                
-                # Apply top-k filtering
-                filtered_logits = top_k_logits(logits, topk)
-                probs = torch.softmax(filtered_logits, dim=-1)
-                
-                # Sample next token
-                next_token = torch.multinomial(probs, num_samples=1)
-                input_ids = torch.cat([input_ids, next_token], dim=1)
-                
-                # Stop if we hit EOS token
-                if next_token.item() == self.tokenizer.eos_token_id:
-                    break
-
-        return self.tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=True)
-
-    def postprocess(self, token: str) -> str:
+    def postprocess(self, tokens):
      """
-    Clean up raw tokens from Gemma tokenizer so they display like GPT-2 tokens in GLTR.
-     """
-
-     if hasattr(token, "item"):
-        token = token.item()
-
-     if isinstance(token, int):
-        return self.tokenizer.convert_ids_to_tokens([token])[0]
-
-     if isinstance(token, (list, tuple)):
-        token = self.tokenizer.convert_ids_to_tokens(token)[0]
-
-    # ---- Cleanup rules ----
-     if not isinstance(token, str):
-        return str(token)
-
-    # Leading whitespace marker (like GPT-2's Ġ)
-     if token.startswith("▁"):  # SentencePiece-style "word boundary"
-        token = " " + token[1:]
-
-    # Handle common special markers
-     if token in ["<bos>", "<s>", "</s>", "<pad>", "<unk>", "<eos>"]:
-        return token
-
-    # Normalize unicode punctuation like GPT-2 does
-     token = token.replace("Ċ", "\n") \
-                 .replace("Ġ", " ") \
-                 .replace("â€", "\"") \
-                 .replace("â€™", "'") \
-                 .replace("â€“", "-")
-
-     return token
-
-
+    Process tokens for proper display and spacing using the tokenizer's decode method.
+    """
+     if isinstance(tokens, (list, tuple)) and all(isinstance(t, int) for t in tokens):
+        # If it's a list of token IDs, decode it directly
+        decoded = self.tokenizer.decode(tokens, skip_special_tokens=True)
+     elif hasattr(tokens, "item"):  # Handle torch tensors
+        tokens = tokens.item()
+        decoded = self.tokenizer.decode([tokens], skip_special_tokens=True)
+     elif isinstance(tokens, int):  # Handle a single token ID
+        decoded = self.tokenizer.decode([tokens], skip_special_tokens=True)
+     elif isinstance(tokens, (list, tuple)):  # For pre-converted string tokens
+        decoded = "".join(tokens)
+     else:
+        decoded = str(tokens)
+    
+    # Replace tokenizer-specific characters
+     decoded = decoded.replace('▁', '  ')     # SentencePiece space marker
+     decoded = decoded.replace('\u0120', '  ') # GPT-style space marker (Ġ)
+     decoded = decoded.replace('Ġ', '  ')      # Direct Ġ character
+     decoded = decoded.replace('\u010A', '\n') # Line break
+     decoded = decoded.replace('Ċ', '\n')     # Another line break variant
+    
+     return decoded
 
 @register_api(name='gpt-2-small')
 class LM(AbstractLanguageChecker):
