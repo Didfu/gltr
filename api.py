@@ -12,30 +12,6 @@ import traceback
 from accelerate import init_empty_weights, infer_auto_device_map
 import requests
 from types import SimpleNamespace
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, Mxfp4Config, MT5Tokenizer, MT5ForConditionalGeneration
-from urllib.parse import quote_plus
-from typing import List, Dict, Any
-from difflib import SequenceMatcher
-import asyncio
-import requests.packages.urllib3.util.connection as urllib3_cn
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import numpy as np
-import torch, traceback
-import socket
-import token
-import numpy as np
-import fitz  # PyMuPDF
-import base64
-import torch
-import time
-import os
-import re
-from dotenv import load_dotenv
-import traceback
-from accelerate import init_empty_weights, infer_auto_device_map
-import requests
-from types import SimpleNamespace
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, Mxfp4Config, T5Tokenizer, T5ForConditionalGeneration
 from urllib.parse import quote_plus
 from typing import List, Dict, Any
@@ -79,25 +55,6 @@ if not hasattr(socket, "AF_INET"):
     socket = importlib.import_module("socket")
     sys.modules["socket"] = socket
 
-from PIL import Image as PILImage
-
-# Add these to your imports at the top of api.py
-from io import BytesIO
-import tempfile
-from datetime import datetime
-
-# For PDF generation
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, 
-    HRFlowable, KeepTogether, CondPageBreak
-)
-from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
-from PIL import Image as PILImage
-
 # For GLTR visualization with Pyppeteer
 import asyncio
 try:
@@ -121,59 +78,59 @@ FACTCHECK_API_KEY = os.getenv("FACTCHECK_API_KEY")
 GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY")
 GOOGLE_CSE_CX = os.getenv("GOOGLE_CSE_CX")
 
+
+
+def preprocess_pdf_text(raw_text: str) -> str:
+    """
+    Cleans raw PDF text before passing to the analysis pipeline.
+    Removes excessive whitespace, page headers/footers, and junk chars
+    while preserving structure and readability.
+    """
+
+    # Normalize Unicode
+    text = unicodedata.normalize("NFKC", raw_text)
+
+    #  Remove control characters & non-printables
+    text = re.sub(r'[^\x20-\x7E\n]', ' ', text)
+
+    # Remove PDF headers/footers (common)
+    text = re.sub(r'Page\s*No\s*\d+\s*Department.*', '', text, flags=re.IGNORECASE)
+    # Normalize whitespace
+    text = re.sub(r'\t+', ' ', text)
+    text = re.sub(r' {2,}', ' ', text)
+    text = re.sub(r' *\n *', '\n', text)
+
+    # Merge split lines that continue sentences
+    text = re.sub(r'(?<![.:\-])\n(?!\n)', ' ', text)
+
+    # Preserve paragraph breaks
+    text = re.sub(r'\n{2,}', '\n\n', text)
+
+    # Simplify punctuation and artifacts
+    text = re.sub(r'([.,;:!?]){2,}', r'\1', text)
+    text = re.sub(r'[\-–_]{3,}', '—', text)
+
+    # Normalize spacing around punctuation
+    text = re.sub(r'\s*([:/])\s*', r'\1 ', text)
+
+    # Collapse long underscore/dot sequences (tables, dividers)
+    text = re.sub(r'[\._]{4,}', ' ', text)
+
+    # Remove short meaningless lines (optional)
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if len(line) > 2:
+            lines.append(line)
+    text = "\n".join(lines).strip()
+
+    return text
 # ================= FACTCHECK UTILS =================
 def normalize(text: str) -> str:
     return re.sub(r'\s+', ' ', text.lower()).strip()
 
 def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
-
-
-def _detectgpt_window(args):
-    """
-    Worker for DetectGPT window analysis (called in parallel threads).
-    Each window computes its perturbed likelihoods and score.
-    """
-    self_ref, tokens_slice, n_perturbations, span_length, pct, buffer_size = args
-    try:
-        truncated_text = self_ref.tokenizer.decode(tokens_slice, skip_special_tokens=True)
-
-        # Generate perturbations
-        perturbed_texts = []
-        for _ in range(n_perturbations):
-            pert = self_ref.perturb_text(truncated_text, span_length, pct, buffer_size)
-            if pert and pert.strip() and pert != truncated_text:
-                perturbed_texts.append(pert)
-
-        if not perturbed_texts:
-            print("⚠️ All perturbations failed for window.")
-            return None
-
-        # Compute perturbed likelihoods
-        perturbed_lls = []
-        with torch.no_grad():
-            for pert_text in perturbed_texts:
-                ll = self_ref.get_ll(pert_text)
-                if ll is not None:
-                    perturbed_lls.append(ll)
-
-        if not perturbed_lls:
-            return None
-
-        perturbed_ll_mean = np.mean(perturbed_lls)
-        detectgpt_score = self_ref.global_orig_ll - perturbed_ll_mean  # use shared global original_ll
-
-        torch.cuda.empty_cache()  # optional cleanup
-
-        return {
-            "detectgpt_score": float(detectgpt_score),
-            "perturbed_ll_mean": float(perturbed_ll_mean),
-            "perturbed_ll_std": float(np.std(perturbed_lls) if len(perturbed_lls) > 1 else 1),
-            "tokens_analyzed": len(tokens_slice)
-        }
-    except Exception as e:
-        print(f"⚠️ Window analysis failed: {e}")
-        return None
 
 class AbstractLanguageChecker:
     """
@@ -243,134 +200,160 @@ class AbstractLanguageChecker:
      min_values = values[:, -1]
      return torch.where(logits < min_values,torch.ones_like(logits, torch_dtype=logits.dtype) * -1e10,logits)
 
-@register_api(name='gemma-3n-E2B-it')
-class Gemma3N2BItChecker:
+_MODULE_INITIALIZED = False
+@register_api(name='gemma-3-270m-it')
+class Gemma2BItChecker:
     cache_dir=r"C:\Users\dhruv mahyavanshi\.cache\huggingface\hub"
     os.environ["XDG_CACHE_HOME"] = cache_dir
     EXTRA_ID_PATTERN = re.compile(r"<extra_id_\d+>")
+    _models_loaded = False
+    _shared_model = None
+    _shared_tokenizer = None
+    _shared_mask_model = None
+    _shared_mask_tokenizer = None
+    _shared_device = None
     def __init__(self,
-                 base_model_name="google/gemma-3n-E2B-it",
-                 mask_filling_model_name="google/mt5-base",
-                 hfauth=auth, 
-                 topk=40,
-                 int8=False,
-                 half=False,
-                 base_half=False):
-        
-        self.device = "cpu"
+                base_model_name="google/gemma-3-270m-it",
+                mask_filling_model_name="google-t5/t5-small",
+                hfauth=auth,
+                topk=40,
+                int8=False,
+                half=False,
+                base_half=False):
+
+        # ✅ Prevent multiple loads (shared class cache)
+        if Gemma2BItChecker._models_loaded:
+            print("✅ Models already loaded — reusing existing models.")
+            self.model = Gemma2BItChecker._shared_model
+            self.tokenizer = Gemma2BItChecker._shared_tokenizer
+            self.mask_model = Gemma2BItChecker._shared_mask_model
+            self.mask_tokenizer = Gemma2BItChecker._shared_mask_tokenizer
+            self.device = Gemma2BItChecker._shared_device
+            self.topk = topk
+            self.base_model_name = base_model_name
+            self.mask_filling_model_name = mask_filling_model_name
+            return
+
+        # ============ DEVICE SELECTION ============ #
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            print(f'✓ Using GPU: {torch.cuda.get_device_name(0)}')
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+            print(f'✓ VRAM Available: {vram_gb:.2f} GB')
+        else:
+            self.device = torch.device("cpu")
+            print('⚠ CUDA not available, using CPU')
+
         self.topk = topk
         self.base_model_name = base_model_name
         self.mask_filling_model_name = mask_filling_model_name
-        
-        # ============ Load Base Model (following run.py exactly) ============
+        self.cache_dir = getattr(self, "cache_dir", os.path.join(os.getcwd(), "model_cache"))
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+        # ============ LOAD BASE MODEL (Gemma) ============ #
         print(f'Loading BASE model {base_model_name}...')
-        base_model_kwargs = {}
-        if 'gemma' in base_model_name:
-            base_model_kwargs.update(dict(torch_dtype=torch.float16))
-        
-        # Check if using local model path
-        if os.path.exists(base_model_name):
+
+        if self.device.type == "cuda":
+            print("→ Using 4-bit quantized loading for Gemma (VRAM-efficient)")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 base_model_name,
-                trust_remote_code=True,
-                local_files_only=True,
-                cache_dir=self.cache_dir,
-                **base_model_kwargs
-            )
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                base_model_name,
+                device_map="auto",
+                quantization_config=bnb_config,
                 trust_remote_code=True,
                 token=hfauth,
-                cache_dir=self.cache_dir,
-                **base_model_kwargs
-            )
-
-        optional_tok_kwargs = {}
-        if "facebook/opt-" in base_model_name:
-            print("Using non-fast tokenizer for OPT")
-            optional_tok_kwargs['fast'] = False
-        
-        # Check if using local tokenizer path
-        if os.path.exists(base_model_name):
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                base_model_name,
-                trust_remote_code=True,
-                local_files_only=True,
-                cache_dir=self.cache_dir,
-                **optional_tok_kwargs
-            )
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                base_model_name,
-                trust_remote_code=True,
-                token=hfauth,
-                cache_dir=self.cache_dir,
-                **optional_tok_kwargs
-            )
-        
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        
-        
-        self.model.eval()
-        print(f'Base model loaded on {self.device}')
-        
-        # ============ Load Mask Filling Model ============
-        int8_kwargs = {}
-        half_kwargs = {}
-        if int8:
-            int8_kwargs = dict(load_in_8bit=True, device_map='auto', torch_dtype=torch.bfloat16)
-        elif half:
-            half_kwargs = dict(torch_dtype=torch.bfloat16)
-
-        print(f'Loading mask filling model {mask_filling_model_name}...')
-
-        # Check if using local model path
-        if os.path.exists(mask_filling_model_name):
-            self.mask_model = MT5ForConditionalGeneration.from_pretrained(
-                mask_filling_model_name,
-                cache_dir=self.cache_dir,
-                local_files_only=True,
-                **int8_kwargs,
-                **half_kwargs
-            )
-        else:
-            self.mask_model = MT5ForConditionalGeneration.from_pretrained(
-                mask_filling_model_name,
-                cache_dir=self.cache_dir,
-                **int8_kwargs,
-                **half_kwargs
-            )
-
-        # Do the same for the tokenizer
-        try:
-            n_positions = self.mask_model.config.max_position_embeddings
-        except AttributeError:
-            try:
-                n_positions = self.mask_model.config.n_positions
-            except AttributeError:
-                n_positions = 1024
-
-        if os.path.exists(mask_filling_model_name):
-            self.mask_tokenizer = MT5Tokenizer.from_pretrained(
-                mask_filling_model_name,
-                model_max_length=n_positions,
-                cache_dir=self.cache_dir,
-                local_files_only=True
-            )
-        else:
-            self.mask_tokenizer = MT5Tokenizer.from_pretrained(
-                mask_filling_model_name,
-                model_max_length=n_positions,
                 cache_dir=self.cache_dir
             )
-                
-        
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+                token=hfauth,
+                cache_dir=self.cache_dir
+            )
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            base_model_name,
+            trust_remote_code=True,
+            token=hfauth,
+            cache_dir=self.cache_dir
+        )
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        self.model.eval()
+        torch.set_grad_enabled(False)
+        self.model.config.use_cache = False
+        print(f'✓ Base model loaded (4-bit) on {self.device}')
+
+        # GPU memory check
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+            mem_used = torch.cuda.memory_allocated(0) / 1e9
+            mem_total = torch.cuda.get_device_properties(0).total_memory / 1e9
+            mem_free = mem_total - mem_used
+            print(f'📊 After base model - GPU Memory: {mem_used:.2f} GB / {mem_total:.2f} GB (Free: {mem_free:.2f} GB)')
+        else:
+            mem_free = None
+
+        # ============ LOAD MASK FILLING MODEL (T5-small) ============ #
+        if self.device.type == "cuda" and (mem_free is None or mem_free >= 0.5):
+            print("✓ Loading mask model on GPU (4-bit quantized)")
+            bnb_mask_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+            self.mask_model = T5ForConditionalGeneration.from_pretrained(
+                mask_filling_model_name,
+                device_map="auto",
+                quantization_config=bnb_mask_config,
+                cache_dir=self.cache_dir
+            )
+            mask_device = self.device
+        else:
+            print("⚠️  Loading mask model on CPU to save VRAM")
+            self.mask_model = T5ForConditionalGeneration.from_pretrained(
+                mask_filling_model_name,
+                torch_dtype=torch.float32,
+                cache_dir=self.cache_dir
+            )
+            mask_device = torch.device("cpu")
+
+        self.mask_tokenizer = T5Tokenizer.from_pretrained(
+            mask_filling_model_name,
+            cache_dir=self.cache_dir,
+            model_max_length=512
+        )
+
         self.mask_model.eval()
-        print(f'Mask filling model loaded on {self.device}')
-        print(f'All models ready on {self.device}')
-    
+        torch.set_grad_enabled(False)
+        print(f'✓ Mask filling model loaded on {mask_device}')
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+            mem_used = torch.cuda.memory_allocated(0) / 1e9
+            mem_total = torch.cuda.get_device_properties(0).total_memory / 1e9
+            print(f'✓ Final GPU Memory Used: {mem_used:.2f} GB / {mem_total:.2f} GB')
+
+        print(f'✅ All models ready - Base: {self.device}, Mask: {mask_device}')
+
+        # ============ SHARE MODELS ============ #
+        Gemma2BItChecker._shared_model = self.model
+        Gemma2BItChecker._shared_tokenizer = self.tokenizer
+        Gemma2BItChecker._shared_mask_model = self.mask_model
+        Gemma2BItChecker._shared_mask_tokenizer = self.mask_tokenizer
+        Gemma2BItChecker._shared_device = self.device
+        Gemma2BItChecker._models_loaded = True
+
     async def _generate_gltr_image_async(self, gltr_data: dict, output_path: str = None) -> str:
         """
         Generate high-resolution GLTR visualization using Playwright with multi-page support
@@ -1515,7 +1498,13 @@ class Gemma3N2BItChecker:
         detectgpt_result = None
         if include_detectgpt:
             print("Computing DetectGPT score...")
-            detectgpt_result = self.detectgpt_score(in_text)
+            clean_text = preprocess_pdf_text(in_text)
+            if len(clean_text) < 10:
+                print("⚠️ Cleaned text too short — reverting to original.")
+                clean_text = in_text
+
+            print(f"DetectGPT: cleaned text length = {len(clean_text)}")
+            detectgpt_result = self.detectgpt_score(clean_text)
     
         # ============ FastDetect Score ============
         fastdetect_result = None
@@ -2227,6 +2216,7 @@ class Gemma3N2BItChecker:
         elements.append(Spacer(1, 0.3*inch))
         
         return elements
+    
 
     def build_pdf_gltr_section(self, styles, json_data: dict):
         """Build comprehensive GLTR visualization section with proper page handling"""
@@ -2539,7 +2529,7 @@ class Gemma3N2BItChecker:
                 # Technical details
                 technical = Paragraph(
                     "<b>Technical Details:</b> DetectGPT's effectiveness stems from exploiting the 'inverse scaling' phenomenon: "
-                    "as language models improve, they become more detectable via this method. The algorithm uses MT5 for mask-filling "
+                    "as language models improve, they become more detectable via this method. The algorithm uses T5 for mask-filling "
                     "perturbations, generating alternative phrasings while preserving semantic meaning. Statistical significance "
                     "increases with text length; results are most reliable for texts exceeding 100 tokens.",
                     styles['DetailText']
@@ -3232,13 +3222,34 @@ class Gemma3N2BItChecker:
         return text
 
     def replace_masks(self, texts, mask_top_p=1.0):
-            """Replace masks using the mask filling model"""
-            n_expected = self.count_masks(texts)
-            stop_id = self.mask_tokenizer.encode(f"<extra_id_{max(n_expected)}>")[0]
-            
-            tokens = self.mask_tokenizer(texts, return_tensors="pt", padding=True).to(self.device)
-            
-            with torch.no_grad():
+        """Replace masks using the mask filling model - GPU optimized but keeping original logic"""
+        n_expected = self.count_masks(texts)
+        if not n_expected or max(n_expected) == 0:
+            return texts
+        
+        stop_id = self.mask_tokenizer.encode(f"<extra_id_{max(n_expected)}>")[0]
+        
+        tokens = self.mask_tokenizer(
+            texts, 
+            return_tensors="pt", 
+            padding=True,
+            truncation=True,
+            max_length=512
+        ).to(self.device)
+        
+        with torch.no_grad():
+            # Use CUDA mixed precision if available
+            if torch.cuda.is_available():
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    outputs = self.mask_model.generate(
+                        **tokens,
+                        max_length=150,  # ← KEY: Use max_length like original
+                        do_sample=True,
+                        top_p=mask_top_p,  # ← Default 1.0 like original
+                        num_return_sequences=1,
+                        eos_token_id=stop_id
+                    )
+            else:
                 outputs = self.mask_model.generate(
                     **tokens,
                     max_length=150,
@@ -3247,15 +3258,22 @@ class Gemma3N2BItChecker:
                     num_return_sequences=1,
                     eos_token_id=stop_id
                 )
-            
-            return self.mask_tokenizer.batch_decode(outputs, skip_special_tokens=False)
+        
+        decoded = self.mask_tokenizer.batch_decode(outputs, skip_special_tokens=False)
+        
+        # Cleanup
+        del tokens, outputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return decoded
 
     def perturb_texts_single(self, texts, span_length, pct, ceil_pct=False, buffer_size=1):
-        """Perturb a batch of texts - single round with better error handling"""
+        """Perturb a batch of texts - keeping original logic"""
         masked_texts = [self.tokenize_and_mask(x, span_length, pct, ceil_pct, buffer_size) 
                         for x in texts]
         
-        # Check if masking created valid masks
+        # Simple validation
         valid_masks = [text for text in masked_texts if '<extra_id_' in text]
         if len(valid_masks) != len(masked_texts):
             print(f"WARNING: {len(masked_texts) - len(valid_masks)} texts had no valid masks")
@@ -3264,15 +3282,15 @@ class Gemma3N2BItChecker:
         extracted_fills = self.extract_fills(raw_fills)
         perturbed_texts = self.apply_extracted_fills_robust(masked_texts, extracted_fills)
         
+        # Simple retry logic from original
         attempts = 1
-        max_attempts = 5  # Reduced from 15 - if it fails 5 times, it won't work
+        max_attempts = 5
         while '' in perturbed_texts and attempts < max_attempts:
             idxs = [idx for idx, x in enumerate(perturbed_texts) if x == '']
             print(f'WARNING: {len(idxs)} texts have no fills. Retrying with less masking [attempt {attempts}].')
             
-            # Progressively reduce masking on retries
-            retry_pct = max(0.1, pct - (0.05 * attempts))  # Reduce by 5% each attempt
-            retry_span = max(1, span_length - (attempts // 2))  # Reduce span length
+            retry_pct = max(0.1, pct - (0.05 * attempts))
+            retry_span = max(1, span_length - (attempts // 2))
             
             masked_texts_retry = [self.tokenize_and_mask(texts[idx], retry_span, retry_pct, ceil_pct, buffer_size) 
                                 for idx in idxs]
@@ -3285,23 +3303,30 @@ class Gemma3N2BItChecker:
             
             attempts += 1
         
-        # Final fallback: return original texts for failed ones
+        # Final fallback
         for idx, text in enumerate(perturbed_texts):
             if text == '':
                 print(f"WARNING: Text {idx} failed all perturbation attempts. Using original.")
                 perturbed_texts[idx] = texts[idx]
         
         return perturbed_texts
+
     def perturb_text(self, text, span_length=2, pct=0.3, buffer_size=1):
-        """Perturb a single text (assumes text is already ≤512 tokens)"""
+        """Perturb a single text - keeping original logic"""
         try:
-            # ✅ Remove chunking - text is already truncated by caller
+            tokens = self.tokenizer.encode(text)
+            
+            if len(tokens) > 400:
+                print(f"Text is long ({len(tokens)} tokens). Using chunking approach...")
+                return self.perturb_long_text(text, span_length, pct, buffer_size)
+            
+            # Normal perturbation
             perturbed = self.perturb_texts_single([text], span_length, pct, buffer_size=buffer_size)
             
             if perturbed and perturbed[0]:
                 return perturbed[0]
             
-            # Fallback: reduce masking
+            # Fallback
             print(f"Initial perturbation failed. Trying with reduced masking...")
             perturbed = self.perturb_texts_single([text], span_length=1, pct=0.15, buffer_size=buffer_size)
             
@@ -3310,22 +3335,20 @@ class Gemma3N2BItChecker:
         except Exception as e:
             print(f"Perturbation failed: {e}")
             return text
+
     def perturb_long_text(self, text, span_length, pct, buffer_size):
-        """Perturb long text by chunking into sentences"""
+        """Perturb long text by chunking into sentences - original logic"""
         import re
         
-        # Split into sentences
         sentences = re.split(r'([.!?]+\s+)', text)
         sentences = [s for s in sentences if s.strip()]
         
         if len(sentences) <= 1:
-            # Can't chunk, use original method with reduced masking
             return self.perturb_texts_single([text], span_length=1, pct=0.15, buffer_size=buffer_size)[0]
         
-        # Perturb sentences in smaller batches
         perturbed_sentences = []
         for sentence in sentences:
-            if len(sentence.strip()) < 10:  # Skip very short sentences
+            if len(sentence.strip()) < 10:
                 perturbed_sentences.append(sentence)
                 continue
             
@@ -3336,7 +3359,7 @@ class Gemma3N2BItChecker:
                 perturbed_sentences.append(sentence)
         
         return ''.join(perturbed_sentences)
-    
+
     def get_ll(self, text):
         """Compute log-likelihood of text under the model"""
         try:
@@ -3349,93 +3372,62 @@ class Gemma3N2BItChecker:
         except Exception as e:
             print(f"Likelihood computation failed: {e}")
             return None
-        
-    
 
-    def detectgpt_score(self, text, span_length=2, pct=0.3, n_perturbations=6, buffer_size=1):
+    def detectgpt_score(self, text, span_length=2, pct=0.3, n_perturbations=10, buffer_size=1):
         """
-        Compute DetectGPT score using parallel 3-window sampling:
-        - First 128 tokens
-        - Middle 128 tokens
-        - Last 128 tokens
-        ✅ Runs 3 windows in parallel threads (shared model, safe for Windows)
-        ✅ Computes global original_ll once (faster & consistent)
-        ✅ Returns averaged detectgpt_score, original_ll, and perturbed_ll_mean
+        Compute DetectGPT score using the exact methodology from run.py
         """
         try:
             torch.manual_seed(0)
             np.random.seed(0)
-
-            # === Tokenize text ===
-            full_tokens = self.tokenizer.encode(text)
-            total_tokens = len(full_tokens)
-            print(f"🔹 Total tokens in input: {total_tokens}")
-
-            # === Compute global original log-likelihood once ===
-            print("Computing global original log-likelihood...")
-            with torch.no_grad():
-                self.global_orig_ll = self.get_ll(text)
-            if self.global_orig_ll is None:
-                return {"detectgpt_score": None, "error": "Failed to compute global original_ll"}
-
-            # === Define windows ===
-            if total_tokens <= 128:
-                print("ℹ️ Short text — single window mode.")
-                windows = [full_tokens]
-            else:
-                mid_start = max(0, (total_tokens // 2) - 64)
-                mid_end = min(total_tokens, mid_start + 128)
-                windows = [
-                    full_tokens[:128],
-                    full_tokens[mid_start:mid_end],
-                    full_tokens[-128:] if total_tokens > 128 else full_tokens
-                ]
-                print(f"🪟 Created {len(windows)} windows: first, middle, last")
-
-            # === Run window analyses in parallel threads ===
-            args_list = [(self, w, n_perturbations, span_length, pct, buffer_size) for w in windows]
-            results = []
-
-            with ThreadPoolExecutor(max_workers=min(3, len(windows))) as executor:
-                futures = [executor.submit(_detectgpt_window, args) for args in args_list]
-                for f in as_completed(futures):
-                    res = f.result()
-                    if res:
-                        results.append(res)
-
-            if not results:
-                return {"detectgpt_score": None, "error": "All windows failed"}
-
-            # === Aggregate results ===
-            detectgpt_scores = [r["detectgpt_score"] for r in results if "detectgpt_score" in r]
-            pert_means = [r["perturbed_ll_mean"] for r in results if "perturbed_ll_mean" in r]
-
-            detectgpt_score_mean = float(np.mean(detectgpt_scores)) if detectgpt_scores else 0.0
-            detectgpt_std = float(np.std(detectgpt_scores)) if len(detectgpt_scores) > 1 else 0.0
-
-            pert_mean_mean = float(np.mean(pert_means)) if pert_means else None
-            pert_mean_std = float(np.std(pert_means)) if len(pert_means) > 1 else 0.0
-
-            print(f"✅ Parallel DetectGPT final score: {detectgpt_score_mean:.4f} (±{detectgpt_std:.4f})")
-
-            # === Return structured result ===
+            
+            print(f"Computing original likelihood...")
+            original_ll = self.get_ll(text)
+            if original_ll is None:
+                return {"detectgpt_score": None, "error": "Failed to compute original likelihood"}
+            
+            print(f"Generating {n_perturbations} perturbations...")
+            perturbed_texts = []
+            for i in range(n_perturbations):
+                pert = self.perturb_text(text, span_length, pct, buffer_size)
+                if pert and pert != text and pert != "":
+                    perturbed_texts.append(pert)
+            
+            if len(perturbed_texts) == 0:
+                return {"detectgpt_score": None, "error": "All perturbations failed"}
+            
+            print(f"Computing likelihoods for {len(perturbed_texts)} perturbations...")
+            perturbed_lls = []
+            for pert_text in perturbed_texts:
+                ll = self.get_ll(pert_text)
+                if ll is not None:
+                    perturbed_lls.append(ll)
+            
+            if len(perturbed_lls) == 0:
+                return {"detectgpt_score": None, "error": "Failed to compute perturbed likelihoods"}
+            
+            perturbed_ll_mean = np.mean(perturbed_lls)
+            perturbed_ll_std = np.std(perturbed_lls) if len(perturbed_lls) > 1 else 1
+            print(f"original : {original_ll} and perturbed : {perturbed_ll_mean}")
+            detectgpt_score = original_ll - perturbed_ll_mean
+            
+            print(f"DetectGPT score: {detectgpt_score:.4f}")
+            
             return {
-                "detectgpt_score": detectgpt_score_mean,
-                "detectgpt_std": detectgpt_std,
-                "original_ll": float(self.global_orig_ll),
-                "perturbed_ll_mean": pert_mean_mean,
-                "perturbed_ll_std": pert_mean_std,
-                "n_windows": len(results),
-                "window_scores": detectgpt_scores,
-                "n_perturbations": n_perturbations,
-                "tokens_analyzed_total": sum(r.get("tokens_analyzed", 0) for r in results),
-                "interpretation": "Negative scores suggest AI-generated text (3-window parallel average)"
+                "detectgpt_score": float(detectgpt_score),
+                "original_ll": float(original_ll),
+                "perturbed_ll_mean": float(perturbed_ll_mean),
+                "perturbed_ll_std": float(perturbed_ll_std),
+                "n_perturbations": len(perturbed_lls),
+                "requested_perturbations": n_perturbations,
+                "interpretation": "Negative scores suggest AI-generated text"
             }
-
+        
         except Exception as e:
             print(f"DetectGPT computation failed: {e}")
             traceback.print_exc()
             return {"detectgpt_score": None, "error": str(e)}
+    
     def postprocess(self, tokens):
         if isinstance(tokens, (list, tuple)) and all(isinstance(t, int) for t in tokens):
             decoded = self.tokenizer.decode(tokens, skip_special_tokens=True)

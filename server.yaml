@@ -6,11 +6,8 @@ consumes:
   - application/json
 produces:
   - application/json
-
 basePath: /api
-
 paths:
-
   /all_projects:
     get:
       tags:
@@ -24,12 +21,11 @@ paths:
             type: array
             items:
               type: object
-
   /analyze:
     post:
       tags:
         - all
-      summary: analyze text
+      summary: analyze text with GLTR, DetectGPT, FastDetect, and fact-checking
       operationId: server.analyze
       parameters:
         - in: body
@@ -37,18 +33,109 @@ paths:
           description: request analyze
           schema:
             $ref: "#/definitions/AnalyzeRequest"
-
       responses:
         200:
           description: return analysis results
           schema:
-            type: object
-
-
-
-
+            $ref: "#/definitions/AnalyzeResponse"
+  /analyze_with_pdf:
+    post:
+      tags:
+        - all
+      summary: analyze text with optional PDF overlay for GLTR visualization
+      operationId: server.analyze_with_pdf
+      consumes:
+        - multipart/form-data
+      produces:
+        - application/json
+      parameters:
+        - in: formData
+          name: text
+          type: string
+          required: true
+          description: Text to analyze
+        - in: formData
+          name: project
+          type: string
+          required: false
+          default: gemma-3n-E2B-it
+          description: Model/project name
+        - in: formData
+          name: file
+          type: file
+          required: false
+          description: Optional PDF file for overlay
+        - in: formData
+          name: topk
+          type: integer
+          required: false
+          default: 20
+          description: Top-k value for analysis
+        - in: formData
+          name: include_detectgpt
+          type: boolean
+          required: false
+          default: true
+          description: Include DetectGPT analysis
+        - in: formData
+          name: include_fastdetect
+          type: boolean
+          required: false
+          default: true
+          description: Include FastDetect analysis
+        - in: formData
+          name: include_factcheck
+          type: boolean
+          required: false
+          default: true
+          description: Include fact-checking
+        - in: formData
+          name: max_claims
+          type: integer
+          required: false
+          default: 5
+          description: Maximum number of claims to check
+        - in: formData
+          name: generate_gltr_viz
+          type: boolean
+          required: false
+          default: true
+          description: Whether to generate GLTR visualization image
+      responses:
+        200:
+          description: Analysis result with PDF overlay support
+          schema:
+            $ref: "#/definitions/AnalyzeResponse"
+        400:
+          description: Bad request
+        500:
+          description: Server error
+  /generate_report:
+    post:
+      tags:
+        - report
+      summary: generate PDF report from analysis results
+      operationId: server.generate_report
+      parameters:
+        - in: body
+          name: report_request
+          description: request PDF report generation
+          schema:
+            $ref: "#/definitions/ReportRequest"
+      produces:
+        - application/pdf
+      responses:
+        200:
+          description: PDF report file
+          schema:
+            type: file
+        400:
+          description: Bad request - missing required fields
+        404:
+          description: Project not found
+        500:
+          description: Internal server error
 definitions:
-
   AnalyzeRequest:
     type: object
     required:
@@ -64,3 +151,237 @@ definitions:
         minimum: 1
         maximum: 100
         default: 20
+      include_detectgpt:
+        type: boolean
+        default: true
+      include_fastdetect:
+        type: boolean
+        default: false
+      include_factcheck:
+        type: boolean
+        default: true
+      max_claims:
+        type: integer
+        minimum: 1
+        maximum: 20
+        default: 5
+      generate_gltr_viz:
+        type: boolean
+        default: true
+        description: Whether to generate GLTR visualization image
+  ReportRequest:
+    type: object
+    required:
+      - project
+      - analysis_data
+    properties:
+      project:
+        type: string
+        description: Name of the project/model used for analysis
+      analysis_data:
+        type: object
+        description: Complete analysis result from /analyze endpoint
+        properties:
+          bpe_strings:
+            type: array
+            items:
+              type: string
+          real_topk:
+            type: array
+            items:
+              type: array
+          pred_topk:
+            type: array
+            items:
+              type: array
+          detectgpt:
+            type: object
+          fastdetect:
+            type: object
+          factcheck:
+            type: array
+          gltr_image:
+            type: string
+            description: Path to GLTR visualization image
+      input_text:
+        type: string
+        description: Original input text (optional, for PDF metadata)
+  DetectGPTResult:
+    type: object
+    properties:
+      detectgpt_score:
+        type: number
+        description: DetectGPT score - higher values indicate more likely AI-generated
+      original_ll:
+        type: number
+        description: Original text log-likelihood
+      perturbed_ll_mean:
+        type: number
+        description: Mean log-likelihood of perturbed versions
+      perturbed_ll_std:
+        type: number
+        description: Standard deviation of perturbed log-likelihoods
+      n_perturbations:
+        type: integer
+        description: Number of perturbations used
+      requested_perturbations:
+        type: integer
+        description: Number of perturbations requested
+      interpretation:
+        type: string
+        description: Human-readable interpretation of the score
+      error:
+        type: string
+        description: Error message if computation failed
+  FastDetectResult:
+    type: object
+    properties:
+      success:
+        type: boolean
+        description: Whether the FastDetect API call succeeded
+      prob:
+        type: number
+        description: Probability that text is AI-generated (0-1)
+      crit:
+        type: number
+        description: Criterion value from FastDetect
+      ntoken:
+        type: integer
+        description: Number of tokens analyzed
+      message:
+        type: string
+        description: Message from FastDetect API
+      error:
+        type: string
+        description: Error message if call failed
+  FactMatch:
+    type: object
+    properties:
+      claim_text:
+        type: string
+        description: The original claim text from fact-checker
+      publisher:
+        type: string
+        description: Name of the fact-checking organization
+      rating:
+        type: string
+        description: Fact-check rating (e.g., "True", "False", "Mostly True")
+      title:
+        type: string
+        description: Title of the fact-check article
+      url:
+        type: string
+        description: URL to the full fact-check article
+      date:
+        type: string
+        description: Date of the claim or fact-check
+  SearchMatch:
+    type: object
+    properties:
+      title:
+        type: string
+        description: Title of the search result
+      url:
+        type: string
+        description: URL of the search result
+      snippet:
+        type: string
+        description: Snippet/preview of the content
+      score:
+        type: number
+        description: Relevance score (0-1)
+  ClaimVerification:
+    type: object
+    properties:
+      claim:
+        type: string
+        description: The extracted claim
+      method:
+        type: string
+        description: Verification method used (factcheck_api or custom_search)
+      fact_matches:
+        type: array
+        items:
+          $ref: "#/definitions/FactMatch"
+        description: Fact-check results from Google Fact Check API
+      search_matches:
+        type: array
+        items:
+          $ref: "#/definitions/SearchMatch"
+        description: Related search results from Google Custom Search
+  FactCheckResult:
+    type: array
+    items:
+      $ref: "#/definitions/ClaimVerification"
+    description: Array of claim verification results
+  AnalyzeResult:
+    type: object
+    properties:
+      bpe_strings:
+        type: array
+        items:
+          type: string
+        description: Individual tokens in the text
+      real_topk:
+        type: array
+        items:
+          type: array
+          items:
+            type: number
+        description: Real token positions and probabilities
+      pred_topk:
+        type: array
+        items:
+          type: array
+          items:
+            type: array
+        description: Top-k predictions for each position
+      final_text:
+        type: string
+        description: Reconstructed text from tokens
+      detectgpt:
+        $ref: "#/definitions/DetectGPTResult"
+        description: DetectGPT analysis results (optional)
+      fastdetect:
+        $ref: "#/definitions/FastDetectResult"
+        description: FastDetect analysis results (optional)
+      factcheck:
+        $ref: "#/definitions/FactCheckResult"
+        description: Fact-checking results (optional)
+      gltr_image:
+        type: string
+        description: Path to generated GLTR visualization image (optional)
+      pdf_filename:
+        type: string
+        description: Filename of generated PDF report (optional)
+      error:
+        type: string
+        description: Error message if analysis failed
+  AnalyzeResponse:
+    type: object
+    properties:
+      request:
+        type: object
+        properties:
+          project:
+            type: string
+          text:
+            type: string
+          topk:
+            type: integer
+          include_detectgpt:
+            type: boolean
+          include_fastdetect:
+            type: boolean
+          include_factcheck:
+            type: boolean
+          max_claims:
+            type: integer
+          generate_gltr_viz:
+            type: boolean
+          has_fastdetect_key:
+            type: boolean
+          has_pdf_path:
+            type: boolean
+      result:
+        $ref: "#/definitions/AnalyzeResult"
